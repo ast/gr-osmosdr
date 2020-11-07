@@ -33,11 +33,21 @@
 #include <algorithm>
 #include <osmosdr/ranges.h>
 #include <gnuradio/io_signature.h>
-
-#include "airspyhf_source_c.h"
 #include "arg_helpers.h"
 
+#include "airspyhf_source_c.h"
+
 #define MAX_DEVICES  32 // arbitrary number
+
+#define AIRSPYHF_INFO(message) \
+    { \
+    std::cout << "[AirspyHF] " << __FUNCTION__ << ": " << message << std::endl; \
+    }
+
+#define AIRSPYHF_WARNING(message) \
+    { \
+    std::cerr << "[AirspyHF] " << __FUNCTION__ << ": " << message << std::endl; \
+    }
 
 airspyhf_source_c_sptr make_airspyhf_source_c (const std::string & args)
 {
@@ -55,20 +65,39 @@ _sample_rate(0),
 _center_freq(0),
 _freq_corr(0),
 _dev(nullptr),
-_lna_gain(0),
-_att_gain(0),
-_agc_on(true),
+_lna(1),
+_att(0),
+_agc(1),
 _stream_buff(nullptr)
 {
     int ret;
     
     // TODO: open by serial
-    dict_t dict = params_to_dict(args);
+    dict_t args_dict = params_to_dict(args);
     
-    _dev = NULL;
-    ret = airspyhf_open(&_dev);
-    if(ret != AIRSPYHF_SUCCESS) {
-        throw std::runtime_error("airspyhf_open");
+    if (args_dict.count("serial") != 0) {
+        AIRSPYHF_INFO("using serial" << args_dict.at("serial"));
+
+        uint64_t serial;
+        try {
+            serial = std::stoull(args_dict.at("serial"), nullptr, 16);
+        } catch (const std::invalid_argument &) {
+            throw std::runtime_error("serial is not a hex number");
+        } catch (const std::out_of_range &) {
+            throw std::runtime_error("serial value of out range");
+        }
+        
+        ret = airspyhf_open_sn(&_dev, serial);
+        if(ret != AIRSPYHF_SUCCESS) {
+            throw std::runtime_error("airspyhf_open");
+        }
+    } else {
+        // Open without serial
+        AIRSPYHF_INFO("not using serial");
+        ret = airspyhf_open(&_dev);
+        if(ret != AIRSPYHF_SUCCESS) {
+            throw std::runtime_error("airspyhf_open");
+        }
     }
 
     // At least this size in our work function
@@ -82,12 +111,23 @@ _stream_buff(nullptr)
     ret = airspyhf_get_samplerates(_dev, _samplerates.data(), num_rates);
     assert(ret == AIRSPYHF_SUCCESS);
     
-    // airspyhf_lib_version
-    // airspyhf_board_partid_serialno_read
+    airspyhf_lib_version_t lib_version;
+    airspyhf_read_partid_serialno_t partid_serialno;
+    airspyhf_lib_version(&lib_version);
+    ret = airspyhf_board_partid_serialno_read(_dev, &partid_serialno);
+    assert(ret == AIRSPYHF_SUCCESS);
+    
+    AIRSPYHF_INFO("libairspyhf "
+                  << lib_version.major_version << "."
+                  << lib_version.minor_version << "."
+                  << lib_version.revision);
     
     airspyhf_set_lib_dsp(_dev, true);
-    airspyhf_set_hf_agc(_dev, _agc_on);
+
+    airspyhf_set_hf_agc(_dev, _agc);
     airspyhf_set_hf_agc_threshold(_dev, 1); // 1 = high
+    airspyhf_set_hf_lna(_dev, _lna);
+    airspyhf_set_hf_att(_dev, _att);
     
     set_center_freq(14e6);
     set_sample_rate(768e3);
@@ -114,7 +154,7 @@ int airspyhf_source_c::airspyhf_rx_callback(airspyhf_transfer_t *t)
     while (_stream_buff == nullptr) _stream_cond.wait(lock);
     //_dropped_samples = t->dropped_samples;
     if (t->dropped_samples) {
-        // TODO: fix logging
+        AIRSPYHF_WARNING("dropped_samples: " << t->dropped_samples);
     }
     // Copy to _stream_buff
     std::memcpy(_stream_buff, t->samples, sizeof(gr_complex) * _airspyhf_output_size);
@@ -127,21 +167,26 @@ int airspyhf_source_c::airspyhf_rx_callback(airspyhf_transfer_t *t)
 
 bool airspyhf_source_c::start()
 {
-    if (!_dev) {
-        return false;
-    }
+    assert(_dev != nullptr);
     int ret = airspyhf_start(_dev, _airspyhf_rx_callback, (void *)this);
     assert(ret == AIRSPYHF_SUCCESS);
+    
+    AIRSPYHF_INFO("start");
+    
     return true;
 }
 
 bool airspyhf_source_c::stop()
 {
-    if (!_dev) {
-        return false;
-    }
+    assert(_dev != nullptr);
     int ret = airspyhf_stop(_dev);
     assert(ret == AIRSPYHF_SUCCESS);
+    // Make sure we are not stuck in work function
+    _stream_buff = nullptr;
+    _callback_done_cond.notify_all();
+
+    AIRSPYHF_INFO("stop");
+
     return true;
 }
 
@@ -153,7 +198,7 @@ int airspyhf_source_c::work(int noutput_items,
     
     if (!airspyhf_is_streaming(_dev)) {
         // TODO: check error
-        return -1;
+        return WORK_DONE;
     }
     
     std::unique_lock<std::mutex> lock(_stream_mutex);
@@ -233,6 +278,8 @@ double airspyhf_source_c::set_center_freq(double freq, size_t chan)
     ret = airspyhf_set_freq(_dev, freq);
     if (ret == AIRSPYHF_SUCCESS) {
         _center_freq = freq;
+    } else {
+        AIRSPYHF_WARNING("set_center_freq failed")
     }
     
     return _center_freq;
@@ -252,6 +299,8 @@ double airspyhf_source_c::set_freq_corr(double ppm, size_t chan )
     ret = airspyhf_set_calibration(_dev, ppb);
     if (ret == AIRSPYHF_SUCCESS) {
         _freq_corr = ppm;
+    } else {
+        AIRSPYHF_WARNING("set_freq_corr failed")
     }
     
     return ppm;
@@ -290,15 +339,35 @@ osmosdr::gain_range_t airspyhf_source_c::get_gain_range(const std::string &name,
     if (name == "ATT") {
         // Possible values: 0..8 Range: 0..48 dB Attenuation with 6 dB steps
         return osmosdr::gain_range_t(-48.0,0,6);
-    }
-    if (name == "LNA") {
+    } else if (name == "LNA") {
         // 0 or 1: 1 to activate LNA (alias PreAmp): 1 = +6 dB gain - compensated in digital
         return osmosdr::gain_range_t(0,6,6);
+    } else {
+        AIRSPYHF_WARNING("airspyhf_source_c failed")
     }
     
     return osmosdr::gain_range_t();
 }
 
+/* Gain */
+
+// 0 or 1: 1 to activate LNA (alias PreAmp): 1 = +6 dB gain - compensated in digital
+uint8_t _airspyhf_lna_db_to_flag(double db) {
+    return db >= 3.0 ? 1 : 0;
+}
+
+double _airspyhf_lna_flag_to_db(uint8_t flag) {
+    return flag ? 6.0 : 0.0;
+}
+
+// Possible values: 0..8 Range: 0..48 dB Attenuation with 6 dB steps
+uint8_t _airspyhf_att_db_to_value(double db) {
+    return std::round(-db/6.0);
+}
+
+double _airspyhf_att_value_to_db(uint8_t value) {
+    return value * -6.0;
+}
 
 double airspyhf_source_c::set_gain(double gain, size_t chan)
 {
@@ -311,28 +380,29 @@ double airspyhf_source_c::set_gain(double gain, const std::string & name, size_t
     int ret;
     assert(chan == 0);
     
-    // TODO: avoid multiple sets
-    
     if (name == "ATT") {
-        // Possible values: 0..8 Range: 0..48 dB Attenuation with 6 dB steps
-        uint8_t att = -gain/6.0;
-        ret = airspyhf_set_hf_att(_dev, att);
-        printf("set att: %d\n", att);
-        assert(ret == AIRSPYHF_SUCCESS);
-        _att_gain = -6.0 * att;
-        return  _att_gain;
+        uint8_t att = _airspyhf_att_db_to_value(gain);
+        if(_att != att) {
+            ret = airspyhf_set_hf_att(_dev, att);
+            assert(ret == AIRSPYHF_SUCCESS);
+            _att = att;
+            AIRSPYHF_INFO("att: " << std::to_string(_att));
+        }
+        return _airspyhf_att_value_to_db(_att);
     }
-    if (name == "LNA") {
-        // 0 or 1: 1 to activate LNA (alias PreAmp): 1 = +6 dB gain - compensated in digital
-        uint8_t flag = gain >= 3.0 ? 1 : 0;
-        ret = airspyhf_set_hf_lna(_dev, flag);
-        printf("set lns: %d\n", flag);
-        assert(ret == AIRSPYHF_SUCCESS);
-        _lna_gain = 6.0 * flag;
-        return _lna_gain;
+    else if (name == "LNA") {
+        uint8_t lna = _airspyhf_lna_db_to_flag(gain);
+        if(_lna != lna) {
+            ret = airspyhf_set_hf_lna(_dev, lna);
+            assert(ret == AIRSPYHF_SUCCESS);
+            _lna = lna;
+            AIRSPYHF_INFO("lna: " << std::to_string(_lna));
+        }
+        return _airspyhf_lna_flag_to_db(_lna);
+    } else {
+        AIRSPYHF_WARNING("unknown gain: " << name);
+        return 0.0;
     }
-
-    return 0.0;
 }
 
 double airspyhf_source_c::get_gain(size_t chan)
@@ -347,31 +417,34 @@ double airspyhf_source_c::get_gain(const std::string &name, size_t chan)
     assert(chan == 0);
     
     if (name == "ATT") {
-        return _att_gain;
+        return _airspyhf_att_value_to_db(_att);
+    } else if (name == "LNA") {
+        return _airspyhf_lna_flag_to_db(_lna);
+    } else {
+        AIRSPYHF_WARNING("unknown gain: " << name);
+        return 0.0;
     }
-    if (name == "LNA") {
-        return _lna_gain;
-    }
-    
-    return 0.0;
 }
 
 bool airspyhf_source_c::set_gain_mode(bool automatic, size_t chan) {
-    assert(chan == 0);
     int ret;
-    assert(_dev != nullptr);
-    ret = airspyhf_set_hf_agc(_dev, automatic);
-    printf("set_gain_mode\n");
-    if (ret == AIRSPYHF_SUCCESS) {
-        _agc_on = automatic;
-    }
     
-    return _agc_on;
+    assert(chan == 0);
+    assert(_dev != nullptr);
+
+    if(_agc != automatic) {
+        _agc = automatic;
+        ret = airspyhf_set_hf_agc(_dev, automatic);
+        assert(ret == AIRSPYHF_SUCCESS);
+        AIRSPYHF_INFO("AGC: " << std::to_string(_agc));
+    }
+
+    return _agc;
 }
 
 bool airspyhf_source_c::get_gain_mode(size_t chan) {
     assert(chan == 0);
-    return _agc_on;
+    return _agc;
 }
 
 void airspyhf_source_c::set_iq_balance(const std::complex<double> &balance, size_t chan) {
@@ -381,10 +454,32 @@ void airspyhf_source_c::set_iq_balance(const std::complex<double> &balance, size
     assert(ret == AIRSPYHF_SUCCESS);
 }
 
+void airspyhf_source_c::set_clock_source(const std::string &source,
+                                         const size_t mboard) {
+    // not configurable
+}
+
+std::string airspyhf_source_c::get_clock_source(const size_t mboard) {
+    return "internal";
+}
+
+std::vector<std::string> airspyhf_source_c::get_clock_sources(const size_t mboard) {
+    std::vector<std::string> sources;
+    sources.push_back(get_clock_source(0));
+    return sources;
+}
+
+double airspyhf_source_c::get_clock_rate(size_t mboard) {
+    return 36.864e6;
+}
+
+void airspyhf_source_c::set_clock_rate(double rate, size_t mboard) {
+    // not configurable
+}
+
 std::vector< std::string > airspyhf_source_c::get_antennas(size_t chan)
 {
     assert(chan == 0);
-    
     std::vector<std::string> antennas;
     antennas.push_back(get_antenna(chan));
     return antennas;
@@ -398,6 +493,5 @@ std::string airspyhf_source_c::set_antenna(const std::string & antenna, size_t c
 
 std::string airspyhf_source_c::get_antenna(size_t chan)
 {
-    // TODO: is this configureable?
     return "RX";
 }

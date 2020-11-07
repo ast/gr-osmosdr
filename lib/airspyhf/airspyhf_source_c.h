@@ -59,7 +59,7 @@ public:
     bool start();
     bool stop();
     
-    int work( int noutput_items,
+    int work(int noutput_items,
              gr_vector_const_void_star &input_items,
              gr_vector_void_star &output_items );
     
@@ -90,6 +90,12 @@ public:
     
     void set_iq_balance(const std::complex<double> &balance, size_t chan = 0);
     
+    void set_clock_source(const std::string &source, const size_t mboard = 0);
+    std::string get_clock_source(const size_t mboard);
+    std::vector<std::string> get_clock_sources(const size_t mboard);
+    double get_clock_rate(size_t mboard = 0);
+    void set_clock_rate(double rate, size_t mboard = 0);
+    
     std::vector<std::string> get_antennas( size_t chan = 0);
     std::string set_antenna(const std::string & antenna, size_t chan = 0);
     std::string get_antenna(size_t chan = 0);
@@ -97,25 +103,20 @@ public:
 private:
     airspyhf_device *_dev;
     uint32_t _airspyhf_output_size;
-
-    bool   _agc_on;
-    double _att_gain;
-    double _lna_gain;
+    
+    uint8_t _att;
+    uint8_t _lna;
+    uint8_t _agc;
     
     static int _airspyhf_rx_callback(airspyhf_transfer_t* transfer);
     int airspyhf_rx_callback(airspyhf_transfer_t *transfer);
-        
-    //boost::circular_buffer<gr_complex> *_fifo;
-    //std::mutex _fifo_lock;
-    //std::condition_variable _samp_avail;
     
-    //std::vector< std::pair<double, uint32_t> > _sample_rates;
     std::vector<uint32_t> _samplerates;
     double _sample_rate;
     double _center_freq;
     double _freq_corr;
     
-    uint64_t _dropped_samples;
+    //uint64_t _dropped_samples;
     void *_stream_buff;
     std::mutex _stream_mutex;
     std::condition_variable _stream_cond;
