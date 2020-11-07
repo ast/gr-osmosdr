@@ -29,98 +29,68 @@
 
 #include <stdexcept>
 #include <iostream>
+#include <string>
 #include <algorithm>
-
-#include <boost/assign.hpp>
-#include <boost/format.hpp>
-#include <boost/algorithm/string.hpp>
-#include <boost/thread/thread.hpp>
-
+#include <osmosdr/ranges.h>
 #include <gnuradio/io_signature.h>
 
 #include "airspyhf_source_c.h"
 #include "arg_helpers.h"
 
-using namespace boost::assign;
-
-#define AIRSPYHF_FORMAT_ERROR(ret, msg) \
-  boost::str( boost::format(msg " (%1%)") % ret )
-
-#define AIRSPYHF_THROW_ON_ERROR(ret, msg) \
-  if ( ret != AIRSPYHF_SUCCESS ) \
-  { \
-    throw std::runtime_error( AIRSPYHF_FORMAT_ERROR(ret, msg) ); \
-  }
-
-#define AIRSPYHF_FUNC_STR(func, arg) \
-  boost::str(boost::format(func "(%1%)") % arg) + " has failed"
+#define MAX_DEVICES  32 // arbitrary number
 
 airspyhf_source_c_sptr make_airspyhf_source_c (const std::string & args)
 {
-  return gnuradio::get_initial_sptr(new airspyhf_source_c (args));
+    return gnuradio::get_initial_sptr(new airspyhf_source_c (args));
 }
-
-/*
- * Specify constraints on number of input and output streams.
- * This info is used to construct the input and output signatures
- * (2nd & 3rd args to gr::block's constructor).  The input and
- * output signatures are used by the runtime system to
- * check that a valid number and type of inputs and outputs
- * are connected to this block.  In this case, we accept
- * only 0 input and 1 output.
- */
-static const int MIN_IN = 0;	// mininum number of input streams
-static const int MAX_IN = 0;	// maximum number of input streams
-static const int MIN_OUT = 1;	// minimum number of output streams
-static const int MAX_OUT = 1;	// maximum number of output streams
 
 /*
  * The private constructor
  */
 airspyhf_source_c::airspyhf_source_c (const std::string &args)
-  : gr::sync_block ("airspyhf_source_c",
-        gr::io_signature::make(MIN_IN, MAX_IN, sizeof (gr_complex)),
-        gr::io_signature::make(MIN_OUT, MAX_OUT, sizeof (gr_complex))),
-    _dev(NULL),
-    _sample_rate(0),
-    _center_freq(0),
-    _freq_corr(0)
+: gr::sync_block ("airspyhf_source_c",
+                  gr::io_signature::make(0, 0, 0),
+                  gr::io_signature::make(1, 1, sizeof (gr_complex))),
+_sample_rate(0),
+_center_freq(0),
+_freq_corr(0),
+_dev(nullptr),
+_lna_gain(0),
+_att_gain(0),
+_agc_on(true),
+_stream_buff(nullptr)
 {
-  int ret;
+    int ret;
+    
+    // TODO: open by serial
+    dict_t dict = params_to_dict(args);
+    
+    _dev = NULL;
+    ret = airspyhf_open(&_dev);
+    if(ret != AIRSPYHF_SUCCESS) {
+        throw std::runtime_error("airspyhf_open");
+    }
 
-  dict_t dict = params_to_dict(args);
-
-  _dev = NULL;
-  ret = airspyhf_open( &_dev );
-  AIRSPYHF_THROW_ON_ERROR(ret, "Failed to open Airspy HF+ device")
-
-  uint32_t num_rates;
-  airspyhf_get_samplerates(_dev, &num_rates, 0);
-  uint32_t *samplerates = (uint32_t *) malloc(num_rates * sizeof(uint32_t));
-  airspyhf_get_samplerates(_dev, samplerates, num_rates);
-  for (size_t i = 0; i < num_rates; i++)
-    _sample_rates.push_back( std::pair<double, uint32_t>( samplerates[i], i ) );
-  free(samplerates);
-
-  /* since they may (and will) give us an unsorted array we have to sort it here
-   * to play nice with the monotonic requirement of meta-range later on */
-  std::sort(_sample_rates.begin(), _sample_rates.end());
-
-  std::cerr << "Using libairspyhf" << AIRSPYHF_VERSION << ", samplerates: ";
-
-  for (size_t i = 0; i < _sample_rates.size(); i++)
-    std::cerr << boost::format("%gM ") % (_sample_rates[i].first / 1e6);
-
-  std::cerr << std::endl;
-
-  set_center_freq( (get_freq_range().start() + get_freq_range().stop()) / 2.0 );
-  set_sample_rate( get_sample_rates().start() );
-
-  _fifo = new boost::circular_buffer<gr_complex>(5000000);
-  if (!_fifo) {
-    throw std::runtime_error( std::string(__FUNCTION__) + " " +
-                              "Failed to allocate a sample FIFO!" );
-  }
+    // At least this size in our work function
+    _airspyhf_output_size = airspyhf_get_output_size(_dev);
+    set_output_multiple(_airspyhf_output_size);
+    
+    uint32_t num_rates;
+    airspyhf_get_samplerates(_dev, &num_rates, 0);
+    _samplerates.resize(num_rates);
+    // Get supported rates
+    ret = airspyhf_get_samplerates(_dev, _samplerates.data(), num_rates);
+    assert(ret == AIRSPYHF_SUCCESS);
+    
+    // airspyhf_lib_version
+    // airspyhf_board_partid_serialno_read
+    
+    airspyhf_set_lib_dsp(_dev, true);
+    airspyhf_set_hf_agc(_dev, _agc_on);
+    airspyhf_set_hf_agc_threshold(_dev, 1); // 1 = high
+    
+    set_center_freq(14e6);
+    set_sample_rate(768e3);
 }
 
 /*
@@ -128,310 +98,306 @@ airspyhf_source_c::airspyhf_source_c (const std::string &args)
  */
 airspyhf_source_c::~airspyhf_source_c ()
 {
-  int ret;
-
-  if (_dev) {
-    if ( airspyhf_is_streaming( _dev ) )
-    {
-      ret = airspyhf_stop( _dev );
-      if ( ret != AIRSPYHF_SUCCESS )
-      {
-        std::cerr << AIRSPYHF_FORMAT_ERROR(ret, "Failed to stop RX streaming") << std::endl;
-      }
-    }
-
-    ret = airspyhf_close( _dev );
-    if ( ret != AIRSPYHF_SUCCESS )
-    {
-      std::cerr << AIRSPYHF_FORMAT_ERROR(ret, "Failed to close AirSpy") << std::endl;
-    }
-    _dev = NULL;
-  }
-
-  if (_fifo)
-  {
-    delete _fifo;
-    _fifo = NULL;
-  }
+    airspyhf_close(_dev);
 }
 
+// C trampoline function
 int airspyhf_source_c::_airspyhf_rx_callback(airspyhf_transfer_t *transfer)
 {
-  airspyhf_source_c *obj = (airspyhf_source_c *)transfer->ctx;
-
-  return obj->airspyhf_rx_callback((float *)transfer->samples, transfer->sample_count);
+    airspyhf_source_c *obj = (airspyhf_source_c *)transfer->ctx;
+    return obj->airspyhf_rx_callback(transfer);
 }
 
-int airspyhf_source_c::airspyhf_rx_callback(void *samples, int sample_count)
+int airspyhf_source_c::airspyhf_rx_callback(airspyhf_transfer_t *t)
 {
-  size_t i, n_avail, to_copy, num_samples = sample_count;
-  float *sample = (float *)samples;
-
-  _fifo_lock.lock();
-
-  n_avail = _fifo->capacity() - _fifo->size();
-  to_copy = (n_avail < num_samples ? n_avail : num_samples);
-
-  for (i = 0; i < to_copy; i++ )
-  {
-    /* Push sample to the fifo */
-    _fifo->push_back( gr_complex( *sample, *(sample+1) ) );
-
-    /* offset to the next I+Q sample */
-    sample += 2;
-  }
-
-  _fifo_lock.unlock();
-
-  /* We have made some new samples available to the consumer in work() */
-  if (to_copy) {
-    //std::cerr << "+" << std::flush;
-    _samp_avail.notify_one();
-  }
-
-  /* Indicate overrun, if neccesary */
-  if (to_copy < num_samples)
-    std::cerr << "O" << std::flush;
-
-  return 0; // TODO: return -1 on error/stop
+    std::unique_lock<std::mutex> lock(_stream_mutex);
+    while (_stream_buff == nullptr) _stream_cond.wait(lock);
+    //_dropped_samples = t->dropped_samples;
+    if (t->dropped_samples) {
+        // TODO: fix logging
+    }
+    // Copy to _stream_buff
+    std::memcpy(_stream_buff, t->samples, sizeof(gr_complex) * _airspyhf_output_size);
+    
+    _stream_buff = nullptr;
+    _callback_done_cond.notify_one();
+    
+    return 0;
 }
 
 bool airspyhf_source_c::start()
 {
-  if ( ! _dev )
-    return false;
-
-  int ret = airspyhf_start( _dev, _airspyhf_rx_callback, (void *)this );
-  if ( ret != AIRSPYHF_SUCCESS ) {
-    std::cerr << "Failed to start RX streaming (" << ret << ")" << std::endl;
-    return false;
-  }
-
-  return true;
+    if (!_dev) {
+        return false;
+    }
+    int ret = airspyhf_start(_dev, _airspyhf_rx_callback, (void *)this);
+    assert(ret == AIRSPYHF_SUCCESS);
+    return true;
 }
 
 bool airspyhf_source_c::stop()
 {
-  if ( ! _dev )
-    return false;
-
-  int ret = airspyhf_stop( _dev );
-  if ( ret != AIRSPYHF_SUCCESS ) {
-    std::cerr << "Failed to stop RX streaming (" << ret << ")" << std::endl;
-    return false;
-  }
-
-  return true;
+    if (!_dev) {
+        return false;
+    }
+    int ret = airspyhf_stop(_dev);
+    assert(ret == AIRSPYHF_SUCCESS);
+    return true;
 }
 
-int airspyhf_source_c::work( int noutput_items,
-                        gr_vector_const_void_star &input_items,
-                        gr_vector_void_star &output_items )
+int airspyhf_source_c::work(int noutput_items,
+                            gr_vector_const_void_star &input_items,
+                            gr_vector_void_star &output_items )
 {
-  gr_complex *out = (gr_complex *)output_items[0];
+    assert(noutput_items >= _airspyhf_output_size);
+    
+    if (!airspyhf_is_streaming(_dev)) {
+        // TODO: check error
+        return -1;
+    }
+    
+    std::unique_lock<std::mutex> lock(_stream_mutex);
+    _stream_buff = output_items[0];
+    //_dropped_samples = 0;
+    // Notify callback that the buffer is ready for samples
+    _stream_cond.notify_one();
+    // Wait for callback to write samples to buffer
+    while (_stream_buff != nullptr) _callback_done_cond.wait(lock);
 
-  bool running = false;
-
-  if ( _dev )
-    running = airspyhf_is_streaming( _dev );
-
-  if ( ! running )
-    return WORK_DONE;
-
-  std::unique_lock<std::mutex> lock(_fifo_lock);
-
-  /* Wait until we have the requested number of samples */
-  int n_samples_avail = _fifo->size();
-
-  while (n_samples_avail < noutput_items) {
-    _samp_avail.wait(lock);
-    n_samples_avail = _fifo->size();
-  }
-
-  for(int i = 0; i < noutput_items; ++i) {
-    out[i] = _fifo->at(0);
-    _fifo->pop_front();
-  }
-
-  return noutput_items;
+    return _airspyhf_output_size;
 }
 
 std::vector<std::string> airspyhf_source_c::get_devices()
 {
-  std::vector<std::string> devices;
-  std::string label;
-
-  int ret;
-  airspyhf_device *dev = NULL;
-  ret = airspyhf_open(&dev);
-  if ( AIRSPYHF_SUCCESS == ret )
-  {
-    std::string args = "airspyhf=0,label='AirspyHF'";
-    devices.push_back( args );
-    ret = airspyhf_close(dev);
-  }
-
-  return devices;
+    std::vector<std::string> devices;
+    std::string label;
+    
+    std::vector<uint64_t> serials(MAX_DEVICES);
+    int count = airspyhf_list_devices(serials.data(), MAX_DEVICES);
+    serials.resize(count);
+    
+    for(std::vector<uint64_t>::size_type i = 0; i != serials.size(); i++) {
+        std::stringstream args;
+        args << "airspyhf=" << i << ",";
+        args << "label='AirspyHF'" << ",";
+        args << "serial=" << std::hex << serials[i];
+        devices.push_back(args.str());
+        
+        std::cout << args.str() << std::endl;
+    }
+    
+    return devices;
 }
 
 size_t airspyhf_source_c::get_num_channels()
 {
-  return 1;
+    // This is fixed
+    return 1;
 }
 
 osmosdr::meta_range_t airspyhf_source_c::get_sample_rates()
 {
-  osmosdr::meta_range_t range;
-
-  for (size_t i = 0; i < _sample_rates.size(); i++)
-    range += osmosdr::range_t( _sample_rates[i].first );
-
-  return range;
+    osmosdr::meta_range_t range;
+    
+    for (size_t i = 0; i < _samplerates.size(); i++) {
+        range.push_back(osmosdr::range_t(_samplerates[i]));
+    }
+    
+    return range;
 }
 
 double airspyhf_source_c::set_sample_rate( double rate )
 {
-  int ret = AIRSPYHF_SUCCESS;
-
-  if (_dev) {
-    bool found_supported_rate = false;
-    uint32_t samp_rate_index = 0;
-
-    for( unsigned int i = 0; i < _sample_rates.size(); i++ )
-    {
-      if( _sample_rates[i].first == rate )
-      {
-        samp_rate_index = _sample_rates[i].second;
-
-        found_supported_rate = true;
-      }
+    int ret;
+    ret = airspyhf_set_samplerate(_dev, (uint32_t) rate);
+    if (ret == AIRSPYHF_SUCCESS) {
+        _sample_rate = rate;
     }
-
-    if ( ! found_supported_rate )
-    {
-      throw std::runtime_error(
-        boost::str( boost::format("Unsupported samplerate: %gM") % (rate/1e6) ) );
-    }
-
-    ret = airspyhf_set_samplerate( _dev, samp_rate_index );
-    if ( AIRSPYHF_SUCCESS == ret ) {
-      _sample_rate = rate;
-    } else {
-      AIRSPYHF_THROW_ON_ERROR( ret, AIRSPYHF_FUNC_STR( "airspyhf_set_samplerate", rate ) )
-    }
-  }
-
-  return get_sample_rate();
+    return _sample_rate;
 }
 
 double airspyhf_source_c::get_sample_rate()
 {
-  return _sample_rate;
+    return _sample_rate;
 }
 
 osmosdr::freq_range_t airspyhf_source_c::get_freq_range( size_t chan )
 {
-  osmosdr::freq_range_t range;
-
-  range += osmosdr::range_t( 0.0, 260.0e6 );
-
-  return range;
+    return osmosdr::freq_range_t(9e3, 260.0e6);
 }
 
-double airspyhf_source_c::set_center_freq( double freq, size_t chan )
+double airspyhf_source_c::set_center_freq(double freq, size_t chan)
 {
-  int ret;
-
-  if (_dev) {
-    ret = airspyhf_set_freq( _dev, freq );
-    if ( AIRSPYHF_SUCCESS == ret ) {
-      _center_freq = freq;
-    } else {
-      AIRSPYHF_THROW_ON_ERROR( ret, AIRSPYHF_FUNC_STR( "airspyhf_set_freq", freq ) )
+    int ret;
+    assert(_dev != nullptr);
+    ret = airspyhf_set_freq(_dev, freq);
+    if (ret == AIRSPYHF_SUCCESS) {
+        _center_freq = freq;
     }
-  }
-
-  return get_center_freq( chan );
+    
+    return _center_freq;
 }
 
 double airspyhf_source_c::get_center_freq( size_t chan )
 {
-  return _center_freq;
+    return _center_freq;
 }
 
-double airspyhf_source_c::set_freq_corr( double ppm, size_t chan )
+double airspyhf_source_c::set_freq_corr(double ppm, size_t chan )
 {
-  int ret;
-  int32_t ppb = (int32_t) (ppm * 1.0e3);
-
-  if (_dev) {
-    ret = airspyhf_set_calibration( _dev, ppb );
-    if ( AIRSPYHF_SUCCESS == ret ) {
-      _freq_corr = ppm;
-    } else {
-      AIRSPYHF_THROW_ON_ERROR( ret, AIRSPYHF_FUNC_STR( "airspyhf_set_calibration", ppm ) )
+    int ret;
+    int32_t ppb = (int32_t)(ppm * 1.0e3);
+    assert(_dev != nullptr);
+    
+    ret = airspyhf_set_calibration(_dev, ppb);
+    if (ret == AIRSPYHF_SUCCESS) {
+        _freq_corr = ppm;
     }
-  }
-
-  return ppm;
+    
+    return ppm;
 }
 
-double airspyhf_source_c::get_freq_corr( size_t chan )
+double airspyhf_source_c::get_freq_corr(size_t chan)
 {
-  return _freq_corr;
+    int ret;
+    int32_t ppb = 0;
+    assert(chan == 0);
+    ret = airspyhf_get_calibration(_dev, &ppb);
+    assert(ret == AIRSPYHF_SUCCESS);
+    return ppb / 1.0e3;
 }
 
-std::vector<std::string> airspyhf_source_c::get_gain_names( size_t chan )
+std::vector<std::string> airspyhf_source_c::get_gain_names(size_t chan)
 {
-  return {};
+    assert(chan == 0);
+    std::vector<std::string> gains;
+    gains.push_back("ATT");
+    gains.push_back("LNA");
+    return gains;
 }
 
-osmosdr::gain_range_t airspyhf_source_c::get_gain_range( size_t chan )
+osmosdr::gain_range_t airspyhf_source_c::get_gain_range(size_t chan)
 {
-  return osmosdr::gain_range_t();
+    return get_gain_range("ATT", chan);
 }
 
-osmosdr::gain_range_t airspyhf_source_c::get_gain_range( const std::string & name, size_t chan )
+osmosdr::gain_range_t airspyhf_source_c::get_gain_range(const std::string &name, size_t chan)
 {
-  return osmosdr::gain_range_t();
+    assert(chan == 0);
+    
+    // TODO: enable AGC somewhere
+    
+    if (name == "ATT") {
+        // Possible values: 0..8 Range: 0..48 dB Attenuation with 6 dB steps
+        return osmosdr::gain_range_t(-48.0,0,6);
+    }
+    if (name == "LNA") {
+        // 0 or 1: 1 to activate LNA (alias PreAmp): 1 = +6 dB gain - compensated in digital
+        return osmosdr::gain_range_t(0,6,6);
+    }
+    
+    return osmosdr::gain_range_t();
 }
 
 
-double airspyhf_source_c::set_gain( double gain, size_t chan )
+double airspyhf_source_c::set_gain(double gain, size_t chan)
 {
-  return gain;
+    assert(chan == 0);
+    return set_gain(gain, "ATT", chan);
 }
 
-double airspyhf_source_c::set_gain( double gain, const std::string & name, size_t chan)
+double airspyhf_source_c::set_gain(double gain, const std::string & name, size_t chan)
 {
-  return gain;
+    int ret;
+    assert(chan == 0);
+    
+    // TODO: avoid multiple sets
+    
+    if (name == "ATT") {
+        // Possible values: 0..8 Range: 0..48 dB Attenuation with 6 dB steps
+        uint8_t att = -gain/6.0;
+        ret = airspyhf_set_hf_att(_dev, att);
+        printf("set att: %d\n", att);
+        assert(ret == AIRSPYHF_SUCCESS);
+        _att_gain = -6.0 * att;
+        return  _att_gain;
+    }
+    if (name == "LNA") {
+        // 0 or 1: 1 to activate LNA (alias PreAmp): 1 = +6 dB gain - compensated in digital
+        uint8_t flag = gain >= 3.0 ? 1 : 0;
+        ret = airspyhf_set_hf_lna(_dev, flag);
+        printf("set lns: %d\n", flag);
+        assert(ret == AIRSPYHF_SUCCESS);
+        _lna_gain = 6.0 * flag;
+        return _lna_gain;
+    }
+
+    return 0.0;
 }
 
-double airspyhf_source_c::get_gain( size_t chan )
+double airspyhf_source_c::get_gain(size_t chan)
 {
-  return 0.0;
+    assert(chan == 0);
+    return get_gain("ATT", chan);
+    
 }
 
-double airspyhf_source_c::get_gain( const std::string & name, size_t chan )
+double airspyhf_source_c::get_gain(const std::string &name, size_t chan)
 {
-  return 0.0;
+    assert(chan == 0);
+    
+    if (name == "ATT") {
+        return _att_gain;
+    }
+    if (name == "LNA") {
+        return _lna_gain;
+    }
+    
+    return 0.0;
 }
 
-std::vector< std::string > airspyhf_source_c::get_antennas( size_t chan )
-{
-  std::vector< std::string > antennas;
-
-  antennas += get_antenna( chan );
-
-  return antennas;
+bool airspyhf_source_c::set_gain_mode(bool automatic, size_t chan) {
+    assert(chan == 0);
+    int ret;
+    assert(_dev != nullptr);
+    ret = airspyhf_set_hf_agc(_dev, automatic);
+    printf("set_gain_mode\n");
+    if (ret == AIRSPYHF_SUCCESS) {
+        _agc_on = automatic;
+    }
+    
+    return _agc_on;
 }
 
-std::string airspyhf_source_c::set_antenna( const std::string & antenna, size_t chan )
-{
-  return get_antenna( chan );
+bool airspyhf_source_c::get_gain_mode(size_t chan) {
+    assert(chan == 0);
+    return _agc_on;
 }
 
-std::string airspyhf_source_c::get_antenna( size_t chan )
+void airspyhf_source_c::set_iq_balance(const std::complex<double> &balance, size_t chan) {
+    int ret;
+    float w = std::arg(balance);
+    ret = airspyhf_set_optimal_iq_correction_point(_dev, w);
+    assert(ret == AIRSPYHF_SUCCESS);
+}
+
+std::vector< std::string > airspyhf_source_c::get_antennas(size_t chan)
 {
-  return "RX";
+    assert(chan == 0);
+    
+    std::vector<std::string> antennas;
+    antennas.push_back(get_antenna(chan));
+    return antennas;
+}
+
+std::string airspyhf_source_c::set_antenna(const std::string & antenna, size_t chan)
+{
+    assert(chan == 0);
+    return get_antenna(chan);
+}
+
+std::string airspyhf_source_c::get_antenna(size_t chan)
+{
+    // TODO: is this configureable?
+    return "RX";
 }
