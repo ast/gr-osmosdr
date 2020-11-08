@@ -201,7 +201,8 @@ int airspyhf_source_c::work(int noutput_items,
     std::unique_lock<std::mutex> lock(_stream_mutex);
     
     if(!airspyhf_is_streaming(_dev)) {
-        // strictly speaking need to implement timeout
+        // stop has been called
+        _stream_cond.notify_one();
         return WORK_DONE;
     } else if (noutput_items < _airspyhf_output_size) {
         // wait until we get called with more
