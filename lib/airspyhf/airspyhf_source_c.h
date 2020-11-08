@@ -115,8 +115,7 @@ private:
     double _sample_rate;
     double _center_freq;
     double _freq_corr;
-    
-    //uint64_t _dropped_samples;
+
     void *_stream_buff;
     std::mutex _stream_mutex;
     std::condition_variable _stream_cond;

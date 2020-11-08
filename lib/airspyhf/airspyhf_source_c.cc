@@ -150,18 +150,24 @@ int airspyhf_source_c::_airspyhf_rx_callback(airspyhf_transfer_t *transfer)
 
 int airspyhf_source_c::airspyhf_rx_callback(airspyhf_transfer_t *t)
 {
+    // Take stream lock
     std::unique_lock<std::mutex> lock(_stream_mutex);
-    while (_stream_buff == nullptr) _stream_cond.wait(lock);
-    //_dropped_samples = t->dropped_samples;
+    
+    while (_stream_buff == nullptr && airspyhf_is_streaming(_dev))
+        _stream_cond.wait(lock);
+    
     if (t->dropped_samples) {
         AIRSPYHF_WARNING("dropped_samples: " << t->dropped_samples);
     }
     // Copy to _stream_buff
-    std::memcpy(_stream_buff, t->samples, sizeof(gr_complex) * _airspyhf_output_size);
+    if (_stream_buff != nullptr) {
+        std::memcpy(_stream_buff, t->samples, sizeof(gr_complex) * _airspyhf_output_size);
+    }
     
     _stream_buff = nullptr;
     _callback_done_cond.notify_one();
     
+    // 0 == success
     return 0;
 }
 
@@ -178,13 +184,10 @@ bool airspyhf_source_c::start()
 
 bool airspyhf_source_c::stop()
 {
-    assert(_dev != nullptr);
+    // Take stream lock
+    std::unique_lock<std::mutex> lock(_stream_mutex);
     int ret = airspyhf_stop(_dev);
     assert(ret == AIRSPYHF_SUCCESS);
-    // Make sure we are not stuck in work function
-    _stream_buff = nullptr;
-    _callback_done_cond.notify_all();
-
     AIRSPYHF_INFO("stop");
 
     return true;
@@ -194,20 +197,23 @@ int airspyhf_source_c::work(int noutput_items,
                             gr_vector_const_void_star &input_items,
                             gr_vector_void_star &output_items )
 {
-    assert(noutput_items >= _airspyhf_output_size);
-    
-    if (!airspyhf_is_streaming(_dev)) {
-        // TODO: check error
-        return WORK_DONE;
-    }
-    
+    // Take stream lock
     std::unique_lock<std::mutex> lock(_stream_mutex);
+    
+    if(!airspyhf_is_streaming(_dev)) {
+        // strictly speaking need to implement timeout
+        return WORK_DONE;
+    } else if (noutput_items < _airspyhf_output_size) {
+        // wait until we get called with more
+        return 0;
+    }
+
     _stream_buff = output_items[0];
-    //_dropped_samples = 0;
     // Notify callback that the buffer is ready for samples
     _stream_cond.notify_one();
     // Wait for callback to write samples to buffer
-    while (_stream_buff != nullptr) _callback_done_cond.wait(lock);
+    while ((_stream_buff != nullptr) &&
+           airspyhf_is_streaming(_dev)) _callback_done_cond.wait(lock);
 
     return _airspyhf_output_size;
 }
@@ -254,9 +260,14 @@ osmosdr::meta_range_t airspyhf_source_c::get_sample_rates()
 double airspyhf_source_c::set_sample_rate( double rate )
 {
     int ret;
+    int is_low_if;
+    
     ret = airspyhf_set_samplerate(_dev, (uint32_t) rate);
     if (ret == AIRSPYHF_SUCCESS) {
         _sample_rate = rate;
+        is_low_if = airspyhf_is_low_if(_dev);
+        AIRSPYHF_INFO("samplerate: " << std::to_string(rate));
+        AIRSPYHF_INFO("is_low_if: " << std::to_string(is_low_if));
     }
     return _sample_rate;
 }
@@ -451,6 +462,7 @@ void airspyhf_source_c::set_iq_balance(const std::complex<double> &balance, size
     int ret;
     float w = std::arg(balance);
     ret = airspyhf_set_optimal_iq_correction_point(_dev, w);
+    AIRSPYHF_INFO(std::to_string(w));
     assert(ret == AIRSPYHF_SUCCESS);
 }
 
