@@ -173,10 +173,14 @@ int airspyhf_source_c::airspyhf_rx_callback(airspyhf_transfer_t *t)
 
 bool airspyhf_source_c::start()
 {
+    std::unique_lock<std::mutex> lock(_stream_mutex);
     assert(_dev != nullptr);
+    if(airspyhf_is_streaming(_dev)) {
+        AIRSPYHF_WARNING("already streaming");
+        return false;
+    }
     int ret = airspyhf_start(_dev, _airspyhf_rx_callback, (void *)this);
     assert(ret == AIRSPYHF_SUCCESS);
-    
     AIRSPYHF_INFO("start");
     
     return true;
@@ -186,10 +190,14 @@ bool airspyhf_source_c::stop()
 {
     // Take stream lock
     std::unique_lock<std::mutex> lock(_stream_mutex);
+    assert(_dev != nullptr);
     int ret = airspyhf_stop(_dev);
+    // Wake up streaming and rx_callback threads
+    _stream_cond.notify_one();
+    _callback_done_cond.notify_one();
     assert(ret == AIRSPYHF_SUCCESS);
     AIRSPYHF_INFO("stop");
-
+    
     return true;
 }
 
@@ -201,14 +209,14 @@ int airspyhf_source_c::work(int noutput_items,
     std::unique_lock<std::mutex> lock(_stream_mutex);
     
     if(!airspyhf_is_streaming(_dev)) {
-        // stop has been called
-        _stream_cond.notify_one();
+        // stop has been called.
         return WORK_DONE;
     } else if (noutput_items < _airspyhf_output_size) {
         // wait until we get called with more
+        // if rx_callback is waiting let it wait
         return 0;
     }
-
+    
     _stream_buff = output_items[0];
     // Notify callback that the buffer is ready for samples
     _stream_cond.notify_one();
