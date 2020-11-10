@@ -180,8 +180,11 @@ bool airspyhf_source_c::start()
         return false;
     }
     int ret = airspyhf_start(_dev, _airspyhf_rx_callback, (void *)this);
-    assert(ret == AIRSPYHF_SUCCESS);
-    AIRSPYHF_INFO("start");
+    if(ret != AIRSPYHF_SUCCESS) {
+        AIRSPYHF_WARNING("start failed");
+        return false;
+    }
+    AIRSPYHF_INFO("starting");
     
     return true;
 }
@@ -192,11 +195,14 @@ bool airspyhf_source_c::stop()
     std::unique_lock<std::mutex> lock(_stream_mutex);
     assert(_dev != nullptr);
     int ret = airspyhf_stop(_dev);
+    if(ret != AIRSPYHF_SUCCESS) {
+        AIRSPYHF_WARNING("stop failed");
+        return false;
+    }
     // Wake up streaming and rx_callback threads
     _stream_cond.notify_one();
     _callback_done_cond.notify_one();
-    assert(ret == AIRSPYHF_SUCCESS);
-    AIRSPYHF_INFO("stop");
+    AIRSPYHF_INFO("stopping");
     
     return true;
 }
@@ -210,6 +216,7 @@ int airspyhf_source_c::work(int noutput_items,
     
     if(!airspyhf_is_streaming(_dev)) {
         // stop has been called.
+        AIRSPYHF_WARNING("work: not streaming");
         return WORK_DONE;
     } else if (noutput_items < _airspyhf_output_size) {
         // wait until we get called with more
